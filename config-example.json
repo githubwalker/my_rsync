@@ -1,0 +1,49 @@
+{
+  "folders": [
+    {
+      "local_folder": "/home/myuser/Documents",
+      "destinations": [
+        {
+          "name": "my-own-server-key-auth",
+          "ssh": {
+            "host": "192.168.1.100",
+            "port": 22,
+            "user": "root",
+            "key_file": "/home/myuser/.ssh/id_rsa",
+            "strict_host_key_checking": false
+          },
+          "private_folder": "/root/Private",
+          "dest_subfolder": "documents",
+          "encryption": {
+            "enabled": false
+          }
+        },
+        {
+          "name": "rented-server-encrypted-password-auth",
+          "ssh": {
+            "host": "example.com",
+            "port": 22,
+            "user": "root",
+            "password": "CHANGE_ME",
+            "strict_host_key_checking": false
+          },
+          "private_folder": "/root/Private",
+          "dest_subfolder": "documents",
+          "encryption": {
+            "enabled": true,
+            "unmount_after_sync": true,
+            "mount_options": [
+              "key=passphrase:passphrase_passwd=CHANGE_ME_ECRYPTFS_PASSWORD",
+              "ecryptfs_cipher=aes",
+              "ecryptfs_key_bytes=32",
+              "ecryptfs_passthrough=no",
+              "ecryptfs_enable_filename_crypto=yes",
+              "ecryptfs_fnek_sig=CHANGE_ME_FNEK_SIG",
+              "ecryptfs_sig=CHANGE_ME_SIG"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
