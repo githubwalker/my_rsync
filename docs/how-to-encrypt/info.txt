@@ -1,0 +1,7 @@
+all defaults except key length = 32
+
+passphrase = <numbers>
+
+
+mount -t ecryptfs ~/Private/ ~/Private
+
