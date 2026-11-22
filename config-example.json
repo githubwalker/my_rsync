@@ -4,7 +4,7 @@
       "local_folder": "/home/myuser/Documents",
       "destinations": [
         {
-          "name": "my-own-server-key-auth",
+          "name": "server-key-auth",
           "ssh": {
             "host": "192.168.1.100",
             "port": 22,
@@ -19,7 +19,7 @@
           }
         },
         {
-          "name": "rented-server-encrypted-password-auth",
+          "name": "rented-encrypted-server",
           "ssh": {
             "host": "example.com",
             "port": 22,

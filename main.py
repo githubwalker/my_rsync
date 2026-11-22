@@ -1,12 +1,15 @@
 import argparse
 import json
 import os
+import posixpath
 import shlex
-import subprocess
+import stat
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+
+import paramiko
 
 
 class SyncError(Exception):
@@ -48,6 +51,154 @@ class FolderSyncConfig:
 @dataclass
 class AppConfig:
     folders: list[FolderSyncConfig]
+
+
+class SshSession:
+    def __init__(self, ssh_config: SshConfig, *, dry_run: bool) -> None:
+        self.ssh_config = ssh_config
+        self.dry_run = dry_run
+        self.client: paramiko.SSHClient | None = None
+        self.sftp: paramiko.SFTPClient | None = None
+
+    def __enter__(self) -> "SshSession":
+        if self.dry_run:
+            return self
+
+        client = paramiko.SSHClient()
+
+        if self.ssh_config.strict_host_key_checking:
+            client.load_system_host_keys()
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        connect_kwargs: dict[str, object] = {
+            "hostname": self.ssh_config.host,
+            "port": self.ssh_config.port,
+            "username": self.ssh_config.user,
+            "timeout": 30,
+        }
+
+        if self.ssh_config.key_file:
+            connect_kwargs["key_filename"] = self.ssh_config.key_file
+
+        if self.ssh_config.password:
+            connect_kwargs["password"] = self.ssh_config.password
+
+        client.connect(**connect_kwargs)
+
+        self.client = client
+        self.sftp = client.open_sftp()
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.sftp is not None:
+            self.sftp.close()
+
+        if self.client is not None:
+            self.client.close()
+
+    def run(self, command: str, *, check: bool = True) -> tuple[int, str, str]:
+        print(f"$ ssh {self.ssh_config.user}@{self.ssh_config.host} {shlex.quote(command)}")
+
+        if self.dry_run:
+            return 0, "", ""
+
+        if self.client is None:
+            raise SyncError("SSH client is not connected")
+
+        stdin, stdout, stderr = self.client.exec_command(command)
+
+        exit_code = stdout.channel.recv_exit_status()
+        stdout_text = stdout.read().decode("utf-8", errors="replace")
+        stderr_text = stderr.read().decode("utf-8", errors="replace")
+
+        if stdout_text:
+            print(stdout_text, end="")
+
+        if stderr_text:
+            print(stderr_text, end="", file=sys.stderr)
+
+        if check and exit_code != 0:
+            raise SyncError(
+                f"Remote command failed with code {exit_code}: {command}"
+            )
+
+        return exit_code, stdout_text, stderr_text
+
+    def mkdir_p(self, path: str) -> None:
+        self.run(f"mkdir -p {shlex.quote(path)}")
+
+    def stat(self, path: str) -> paramiko.SFTPAttributes | None:
+        if self.dry_run:
+            return None
+
+        if self.sftp is None:
+            raise SyncError("SFTP client is not connected")
+
+        try:
+            return self.sftp.stat(path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    def put_file(self, local_path: Path, remote_path: str) -> None:
+        print(f"UPLOAD {local_path} -> {remote_path}")
+
+        if self.dry_run:
+            return
+
+        if self.sftp is None:
+            raise SyncError("SFTP client is not connected")
+
+        self.sftp.put(str(local_path), remote_path)
+
+        local_stat = local_path.stat()
+        self.sftp.utime(
+            remote_path,
+            (
+                int(local_stat.st_atime),
+                int(local_stat.st_mtime),
+            ),
+        )
+
+    def remove_file(self, remote_path: str) -> None:
+        print(f"DELETE remote file {remote_path}")
+
+        if self.dry_run:
+            return
+
+        if self.sftp is None:
+            raise SyncError("SFTP client is not connected")
+
+        self.sftp.remove(remote_path)
+
+    def remove_dir(self, remote_path: str) -> None:
+        print(f"DELETE remote directory {remote_path}")
+
+        if self.dry_run:
+            return
+
+        if self.sftp is None:
+            raise SyncError("SFTP client is not connected")
+
+        self.sftp.rmdir(remote_path)
+
+    def listdir_attr(self, remote_path: str) -> list[paramiko.SFTPAttributes]:
+        if self.dry_run:
+            return []
+
+        if self.sftp is None:
+            raise SyncError("SFTP client is not connected")
+
+        try:
+            return self.sftp.listdir_attr(remote_path)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return []
 
 
 def load_config(path: str) -> AppConfig:
@@ -100,117 +251,8 @@ def load_config(path: str) -> AppConfig:
     return AppConfig(folders=folders)
 
 
-def run_command(
-    command: list[str],
-    *,
-    dry_run: bool = False,
-    check: bool = True,
-    capture_output: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    printable = " ".join(shlex.quote(part) for part in command)
-    print(f"$ {printable}")
-
-    if dry_run:
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-
-    result = subprocess.run(
-        command,
-        text=True,
-        check=False,
-        capture_output=capture_output,
-    )
-
-    if check and result.returncode != 0:
-        if result.stdout:
-            print(result.stdout, file=sys.stdout)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-        raise SyncError(f"Command failed with code {result.returncode}: {printable}")
-
-    return result
-
-
-def build_ssh_base_command(ssh: SshConfig) -> list[str]:
-    command = [
-        "ssh",
-        "-p",
-        str(ssh.port),
-    ]
-
-    if ssh.key_file:
-        command.extend(["-i", ssh.key_file])
-
-    if not ssh.strict_host_key_checking:
-        command.extend(
-            [
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-            ]
-        )
-
-    command.append(f"{ssh.user}@{ssh.host}")
-    return command
-
-
-def with_password_prefix(ssh: SshConfig, command: list[str]) -> list[str]:
-    """
-    Password auth for ssh/rsync requires sshpass installed on local machine.
-
-    Example Debian/Ubuntu:
-        apt install sshpass
-
-    If password is not configured, normal SSH key/agent auth is used.
-    """
-    if ssh.password:
-        return ["sshpass", "-p", ssh.password, *command]
-    return command
-
-
-def run_remote(
-    ssh: SshConfig,
-    remote_command: str,
-    *,
-    dry_run: bool = False,
-    check: bool = True,
-    capture_output: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    command = build_ssh_base_command(ssh)
-    command.append(remote_command)
-    command = with_password_prefix(ssh, command)
-
-    return run_command(
-        command,
-        dry_run=dry_run,
-        check=check,
-        capture_output=capture_output,
-    )
-
-
 def shell_quote_path(path: str) -> str:
     return shlex.quote(path)
-
-
-def ensure_remote_directories(
-    destination: DestinationConfig,
-    *,
-    dry_run: bool,
-) -> None:
-    private_folder = destination.private_folder
-    full_dest = remote_destination_folder(destination)
-
-    remote_command = (
-        f"mkdir -p {shell_quote_path(private_folder)} "
-        f"{shell_quote_path(full_dest)}"
-    )
-
-    run_remote(destination.ssh, remote_command, dry_run=dry_run)
 
 
 def remote_destination_folder(destination: DestinationConfig) -> str:
@@ -219,32 +261,36 @@ def remote_destination_folder(destination: DestinationConfig) -> str:
     return f"{private_folder}/{dest_subfolder}"
 
 
-def is_remote_mounted(
+def ensure_remote_directories(
+    session: SshSession,
     destination: DestinationConfig,
-    *,
-    dry_run: bool,
+) -> None:
+    private_folder = destination.private_folder
+    full_dest = remote_destination_folder(destination)
+
+    session.mkdir_p(private_folder)
+    session.mkdir_p(full_dest)
+
+
+def is_remote_mounted(
+    session: SshSession,
+    destination: DestinationConfig,
 ) -> bool:
     private_folder = destination.private_folder
 
-    if dry_run:
+    if session.dry_run:
         print(f"Would check if remote folder is mounted: {private_folder}")
         return False
 
     command = f"findmnt -T {shell_quote_path(private_folder)} >/dev/null 2>&1"
-    result = run_remote(
-        destination.ssh,
-        command,
-        dry_run=False,
-        check=False,
-        capture_output=True,
-    )
-    return result.returncode == 0
+    exit_code, _, _ = session.run(command, check=False)
+
+    return exit_code == 0
 
 
 def mount_ecryptfs(
+    session: SshSession,
     destination: DestinationConfig,
-    *,
-    dry_run: bool,
 ) -> None:
     private_folder = destination.private_folder
     options = destination.encryption.mount_options or []
@@ -260,13 +306,12 @@ def mount_ecryptfs(
         f"{shell_quote_path(private_folder)}"
     )
 
-    run_remote(destination.ssh, remote_command, dry_run=dry_run)
+    session.run(remote_command)
 
 
 def ensure_ecryptfs_mounted(
+    session: SshSession,
     destination: DestinationConfig,
-    *,
-    dry_run: bool,
 ) -> bool:
     """
     Returns True if this function mounted the folder and caller should unmount it later.
@@ -275,7 +320,7 @@ def ensure_ecryptfs_mounted(
     if not destination.encryption.enabled:
         return False
 
-    mounted = is_remote_mounted(destination, dry_run=dry_run)
+    mounted = is_remote_mounted(session, destination)
 
     if mounted:
         print(
@@ -288,82 +333,128 @@ def ensure_ecryptfs_mounted(
         f"[{destination.name}] mounting encrypted folder: "
         f"{destination.private_folder}"
     )
-    mount_ecryptfs(destination, dry_run=dry_run)
+    mount_ecryptfs(session, destination)
     return True
 
 
 def unmount_ecryptfs(
+    session: SshSession,
     destination: DestinationConfig,
-    *,
-    dry_run: bool,
 ) -> None:
     private_folder = destination.private_folder
-
-    remote_command = f"umount {shell_quote_path(private_folder)}"
-    run_remote(destination.ssh, remote_command, dry_run=dry_run)
+    session.run(f"umount {shell_quote_path(private_folder)}")
 
 
-def build_rsync_ssh_command(ssh: SshConfig) -> str:
-    parts = [
-        "ssh",
-        "-p",
-        str(ssh.port),
-    ]
+def should_upload_file(
+    local_path: Path,
+    remote_attrs: paramiko.SFTPAttributes | None,
+) -> bool:
+    if remote_attrs is None:
+        return True
 
-    if ssh.key_file:
-        parts.extend(["-i", ssh.key_file])
+    local_stat = local_path.stat()
 
-    if not ssh.strict_host_key_checking:
-        parts.extend(
-            [
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-            ]
-        )
+    if remote_attrs.st_size != local_stat.st_size:
+        return True
 
-    return " ".join(shlex.quote(part) for part in parts)
+    remote_mtime = int(remote_attrs.st_mtime or 0)
+    local_mtime = int(local_stat.st_mtime)
+
+    return remote_mtime < local_mtime
 
 
-def run_rsync(
+def ensure_remote_parent_dir(
+    session: SshSession,
+    remote_file_path: str,
+) -> None:
+    remote_parent = posixpath.dirname(remote_file_path)
+    session.mkdir_p(remote_parent)
+
+
+def sync_files_native(
+    session: SshSession,
     local_folder: str,
     destination: DestinationConfig,
-    *,
-    dry_run: bool,
-    delete: bool,
-) -> None:
+) -> set[str]:
     source_path = Path(local_folder).expanduser().resolve()
 
     if not source_path.exists():
         raise SyncError(f"Local folder does not exist: {source_path}")
 
-    source = str(source_path)
-    if not source.endswith("/"):
-        source += "/"
+    if not source_path.is_dir():
+        raise SyncError(f"Local path is not a directory: {source_path}")
 
-    remote_dest_folder = remote_destination_folder(destination)
-    remote_target = (
-        f"{destination.ssh.user}@{destination.ssh.host}:"
-        f"{shlex.quote(remote_dest_folder)}/"
+    remote_root = remote_destination_folder(destination)
+    uploaded_or_existing_remote_paths: set[str] = set()
+
+    for local_file in source_path.rglob("*"):
+        if not local_file.is_file():
+            continue
+
+        relative_path = local_file.relative_to(source_path).as_posix()
+        remote_file_path = posixpath.join(remote_root, relative_path)
+        uploaded_or_existing_remote_paths.add(remote_file_path)
+
+        remote_attrs = session.stat(remote_file_path)
+
+        if should_upload_file(local_file, remote_attrs):
+            ensure_remote_parent_dir(session, remote_file_path)
+            session.put_file(local_file, remote_file_path)
+        else:
+            print(f"SKIP unchanged {local_file}")
+
+    return uploaded_or_existing_remote_paths
+
+
+def collect_remote_files(
+    session: SshSession,
+    remote_root: str,
+) -> set[str]:
+    result: set[str] = set()
+
+    def walk(path: str) -> None:
+        for item in session.listdir_attr(path):
+            item_path = posixpath.join(path, item.filename)
+
+            if stat.S_ISDIR(item.st_mode or 0):
+                walk(item_path)
+            elif stat.S_ISREG(item.st_mode or 0):
+                result.add(item_path)
+
+    walk(remote_root)
+    return result
+
+
+def delete_remote_extra_files(
+    session: SshSession,
+    remote_root: str,
+    expected_files: set[str],
+) -> None:
+    remote_files = collect_remote_files(session, remote_root)
+
+    for remote_file in sorted(remote_files - expected_files):
+        session.remove_file(remote_file)
+
+
+def sync_native(
+    session: SshSession,
+    local_folder: str,
+    destination: DestinationConfig,
+    *,
+    delete: bool,
+) -> None:
+    expected_files = sync_files_native(
+        session,
+        local_folder,
+        destination,
     )
 
-    command = [
-        "rsync",
-        "-az",
-        "--info=progress2",
-        "-e",
-        build_rsync_ssh_command(destination.ssh),
-    ]
-
     if delete:
-        command.append("--delete")
-
-    command.extend([source, remote_target])
-
-    command = with_password_prefix(destination.ssh, command)
-
-    run_command(command, dry_run=dry_run)
+        delete_remote_extra_files(
+            session,
+            remote_destination_folder(destination),
+            expected_files,
+        )
 
 
 def sync_destination(
@@ -381,27 +472,28 @@ def sync_destination(
 
     mounted_by_us = False
 
-    try:
-        ensure_remote_directories(destination, dry_run=dry_run)
+    with SshSession(destination.ssh, dry_run=dry_run) as session:
+        try:
+            ensure_remote_directories(session, destination)
 
-        mounted_by_us = ensure_ecryptfs_mounted(destination, dry_run=dry_run)
+            mounted_by_us = ensure_ecryptfs_mounted(session, destination)
 
-        ensure_remote_directories(destination, dry_run=dry_run)
+            ensure_remote_directories(session, destination)
 
-        run_rsync(
-            local_folder,
-            destination,
-            dry_run=dry_run,
-            delete=delete,
-        )
-    finally:
-        if (
-            destination.encryption.enabled
-            and destination.encryption.unmount_after_sync
-            and mounted_by_us
-        ):
-            print(f"[{destination.name}] unmounting encrypted folder")
-            unmount_ecryptfs(destination, dry_run=dry_run)
+            sync_native(
+                session,
+                local_folder,
+                destination,
+                delete=delete,
+            )
+        finally:
+            if (
+                destination.encryption.enabled
+                and destination.encryption.unmount_after_sync
+                and mounted_by_us
+            ):
+                print(f"[{destination.name}] unmounting encrypted folder")
+                unmount_ecryptfs(session, destination)
 
 
 def sync_all(
@@ -432,7 +524,7 @@ def sync_all(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Synchronize local folders to remote SSH destinations via rsync."
+        description="Synchronize local folders to remote SSH destinations."
     )
 
     parser.add_argument(
@@ -445,7 +537,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print commands without executing them.",
+        help="Print planned operations without changing remote files.",
     )
 
     parser.add_argument(
@@ -476,4 +568,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
